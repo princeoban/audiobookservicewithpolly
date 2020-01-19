@@ -5,6 +5,10 @@ AWS Polly is a service that helps convert of text into Speech, making it useful 
 
 ### Solution Architecture
 
+
+![Image of Architecture](polly_archi.png)
+
+
 ### Getting Started
 
 This Solution helps you create the Cloud Formation Stack needed to get the AudioBook Service Configured on your AWS Account. For this you will be needing an aws account and also BASH to run the script from your command prompt or Terminal.
