@@ -1,0 +1,699 @@
+{
+    "Description": "Creates the AWS resources needed for the Polly Batch Audiofile Generator application.",
+    "Parameters": {
+        "EmailAddress": {
+            "Type": "String",
+            "Description": "The email address to send notifications to when a new audiobook is created.",
+            "MinLength": 5
+        },
+        "CodeBucket": {
+            "Type": "String",
+            "Description": "The name of the S3 bucket where the Docker and Lambda source code reside.",
+        },
+        "SourceCidr": {
+            "Type": "String",
+            "Description": "Optional - CIDR/IP range for instance outside access - defaults to 0.0.0.0/0",
+            "Default": "0.0.0.0/0"
+        },
+        "VPC": {
+            "Type": "AWS::EC2::VPC::Id",
+            "Description": "The VPC ID to be used by the AWS Batch compute resources."
+        },
+        "PrivateSubnets": {
+            "Type": "List<AWS::EC2::Subnet::Id>",
+            "Description": "The list of private subnets to be used by the AWS Batch compute resources."
+        },
+        "MaxCharLength": {
+            "Type": "Number",
+            "Description": "The maximum size of the input text can be used with the Amazon Polly SynthesizeSpeech API Operation.",
+            "Default": 1500
+        }
+    },
+    "Metadata": {
+        "AWS::CloudFormation::Interface": {
+            "ParameterGroups": [
+                {
+                    "Label": {
+                        "default": "Mandatory Parameters"
+                    },
+                    "Parameters": [
+                        "EmailAddress",
+                        "VPC",
+                        "CodeBucket",
+                        "PrivateSubnets"
+                    ]
+                },
+                {
+                    "Label": {
+                        "default": "Optional parameters"
+                    },
+                    "Parameters": [
+                        "SourceCidr",
+                        "MaxCharLength"
+                    ]
+                }
+            ],
+            "ParameterLabels": {
+                "EmailAddress": {
+                    "default": "The email address to receive notifications"
+                }
+            }
+        }
+    },
+    "Resources": {
+        "S3Bucket": {
+            "Type": "AWS::S3::Bucket",
+            "DeletionPolicy": "Retain",
+            "Properties": {
+                "BucketName": {
+                    "Fn::Sub": "pollybatch-${AWS::AccountId}-${AWS::Region}"
+                },
+                "WebsiteConfiguration": {
+                    "IndexDocument": "index.html",
+                    "ErrorDocument": "error.html"
+                },
+                "NotificationConfiguration": {
+                    "LambdaConfigurations": [
+                        {
+                            "Function": {
+                                "Fn::GetAtt": [
+                                    "PollyBookUploadNotifierFunction",
+                                    "Arn"
+                                ]
+                            },
+                            "Event": "s3:ObjectCreated:*",
+                            "Filter": {
+                                "S3Key": {
+                                    "Rules": [
+                                        {
+                                            "Name": "suffix",
+                                            "Value": ".txt"
+                                        },
+                                        {
+                                            "Name": "prefix",
+                                            "Value": "books/"
+                                        }
+                                    ]
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        },
+        "S3BucketPolicy": {
+            "Type": "AWS::S3::BucketPolicy",
+            "Properties": {
+                "Bucket": {
+                    "Ref": "S3Bucket"
+                },
+                "PolicyDocument": {
+                    "Statement": [
+                        {
+                            "Action": "s3:GetObject",
+                            "Effect": "Allow",
+                            "Resource": {
+                                "Fn::Sub": "arn:aws:s3:::pollybatch-${AWS::AccountId}-${AWS::Region}/*"
+                            },
+                            "Principal": "*"
+                        }
+                    ]
+                }
+            }
+        },
+        "LambdaInvokePermission": {
+            "Type": "AWS::Lambda::Permission",
+            "Properties": {
+                "FunctionName": {
+                    "Fn::GetAtt": [
+                        "PollyBookUploadNotifierFunction",
+                        "Arn"
+                    ]
+                },
+                "Action": "lambda:InvokeFunction",
+                "Principal": "s3.amazonaws.com",
+                "SourceAccount": {
+                    "Ref": "AWS::AccountId"
+                }
+            }
+        },
+        "PollyBookUploadNotifierRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "book-processor-policy",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "batch:SubmitJob"
+                                    ],
+                                    "Resource": "*"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource": "arn:aws:logs:*:*:*"
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "PollyBookUploadNotifierFunction": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "Description": "Creates an AWS Batch job when a new document is uploaded to S3",
+                "Environment": {
+                    "Variables": {
+                        "AWS_BATCH_JOB_QUEUE": "polly_document_queue",
+                        "AWS_BATCH_JOB_DEFINITION": {
+                            "Ref": "BatchJobDefinition"
+                        },
+                        "AWS_BATCH_JOB_NAME": "polly_document",
+                        "MAX_CHAR_LENGTH": {
+                            "Ref": "MaxCharLength"
+                        },
+                        "SNS_TOPIC": {
+                            "Ref": "SnsTopic"
+                        }
+                    }
+                },
+                "FunctionName": "PollyBookUploadNotifier",
+                "Handler": "index.handler",
+                "MemorySize": 128,
+                "Role": {
+                    "Fn::GetAtt": [
+                        "PollyBookUploadNotifierRole",
+                        "Arn"
+                    ]
+                },
+                "Runtime": "nodejs10.x",
+                "Timeout": 10,
+                "Code": {
+                    "ZipFile": "'use strict';\n\nconsole.log('Loading function');\nconst aws = require('aws-sdk');\nconst s3 = new aws.S3({ apiVersion: '2006-03-01' });\nconst batch = new aws.Batch({ apiVersion: '2016-08-10'});\n\nvar submitBatchJob = function submitBatchJob(bucket, key, topic, maxchars) {\n  var params = {\n    jobDefinition: process.env.AWS_BATCH_JOB_DEFINITION,\n    jobName: process.env.AWS_BATCH_JOB_NAME,\n    jobQueue: process.env.AWS_BATCH_JOB_QUEUE,\n    parameters: {\n      bucket: bucket,\n      key: key,\n      topic: topic,\n      maxchars: maxchars\n    }\n  };\n  return batch.submitJob(params).promise();\n};\n\nexports.handler = (event, context, callback) => {\n    //console.log('Received event:', JSON.stringify(event, null, 2));\n\n    // Get the object from the event and show its content type\n    const bucket = event.Records[0].s3.bucket.name;\n    const key = decodeURIComponent(event.Records[0].s3.object.key.replace(/\\+/g, ' '));\n    const topic = process.env.SNS_TOPIC;\n    const maxchars = process.env.MAX_CHAR_LENGTH;\n    submitBatchJob(bucket, key, topic, maxchars).then(function(data) {\n      console.log(data);\n      console.log('Success');\n      callback(null, data);\n    }).catch(function(err) {\n      callback(err);\n    });\n};\n"
+                }
+            }
+        },
+        "CodeBuildTriggerFunctionRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "lambda.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "codebuild-policy",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents"
+                                    ],
+                                    "Resource": "*"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "codebuild:ListBuilds",
+                                        "codebuild:ListProjects",
+                                        "codebuild:StartBuild",
+                                        "codebuild:StopBuild"
+                                    ],
+                                    "Resource": "*"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "s3:PutObject"
+                                    ],
+                                    "Resource": {
+                                        "Fn::Sub": "arn:aws:s3:::pollybatch-${AWS::AccountId}-${AWS::Region}/*"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "CodeBuildTriggerFunction": {
+            "Type": "AWS::Lambda::Function",
+            "Properties": {
+                "FunctionName": "CodeBuildTriggerResource",
+                "Handler": "index.handler",
+                "Role": {
+                    "Fn::GetAtt": [
+                        "CodeBuildTriggerFunctionRole",
+                        "Arn"
+                    ]
+                },
+                "Description": "Custom CFN resource to starts the build of a CodeBuild project.",
+                "Runtime": "nodejs10.x",
+                "Timeout": 300,
+                "Code": {
+                    "ZipFile": "var AWS = require('aws-sdk');\nvar response = require('cfn-response');\nvar http = require('https');\nexports.handler = function(event, context) {\n    console.log('REQUEST RECEIVED');\n    console.log(event);\n    var src_url = event.ResourceProperties.SrcUrl;\n    if (event.RequestType != 'Create') {\n        response.send(event, context, response.SUCCESS);\n        return;\n    }\n    http.get(src_url, function(res) { // download the source code\n      var data = [];\n      var contentType = res.headers['content-type'];\n      var contentLength = res.headers['content-length'];\n      res.on('data', function(chunk) {\n        data.push(chunk);\n      });\n      res.on('end', function() {\n        var s3 = new AWS.S3();\n        var buffer = Buffer.concat(data);\n        var params = {Bucket: event.ResourceProperties.Bucket, Key: event.ResourceProperties.Key, Body: buffer, ContentType: contentType, ContentLength: contentLength};\n        s3.upload(params, function(err, data) { // save the source code to the inventory bucket\n          if (err) {\n              console.log(err, err.stack); // an error occurred\n              response.send(event, context, response.FAILED, err);\n          } else {\n            console.log(data);\n            var codebuild = new AWS.CodeBuild();\n            var params = { projectName: event.ResourceProperties.ProjectName };\n            codebuild.startBuild(params, function(err, data) {\n              if (err) {\n                console.log(err, err.stack); // an error occurred\n                response.send(event, context, response.FAILED, err);\n              }\n              else {\n                console.log(data);           // successful response\n                response.send(event, context, response.SUCCESS, data);\n              }\n            });\n          }\n        });\n      });\n    });\n}\n"
+                }
+            }
+        },
+        "SecurityGroup": {
+            "Type": "AWS::EC2::SecurityGroup",
+            "Properties": {
+                "GroupDescription": "AWS Batch Beta Security Group",
+                "VpcId": {
+                    "Ref": "VPC"
+                },
+                "SecurityGroupIngress": [
+                    {
+                        "IpProtocol": "tcp",
+                        "FromPort": "22",
+                        "ToPort": "22",
+                        "CidrIp": {
+                            "Ref": "SourceCidr"
+                        }
+                    }
+                ]
+            }
+        },
+        "AWSBatchServiceRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "batch.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "ManagedPolicyArns": [
+                    "arn:aws:iam::aws:policy/service-role/AWSBatchServiceRole"
+                ]
+            }
+        },
+        "EC2InstanceRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "ec2.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "ManagedPolicyArns": [
+                    "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role"
+                ]
+            }
+        },
+        "InstanceProfile": {
+            "Type": "AWS::IAM::InstanceProfile",
+            "Properties": {
+                "Path": "/",
+                "Roles": [
+                    {
+                        "Ref": "EC2InstanceRole"
+                    }
+                ]
+            }
+        },
+        "BatchJobRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "ecs-tasks.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "ManagedPolicyArns": [
+                    "arn:aws:iam::aws:policy/AmazonPollyReadOnlyAccess"
+                ],
+                "Policies": [
+                    {
+                        "PolicyName": "BatchJobPolicy",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "sns:Publish",
+                                    "Resource": {
+                                        "Ref": "SnsTopic"
+                                    }
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "s3:ListAllMyBuckets",
+                                        "s3:GetBucketLocation"
+                                    ],
+                                    "Resource": "arn:aws:s3:::*"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "s3:ListBucket"
+                                    ],
+                                    "Resource": {
+                                        "Fn::Sub": "arn:aws:s3:::pollybatch-${AWS::AccountId}-${AWS::Region}"
+                                    }
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": "s3:*",
+                                    "Resource": {
+                                        "Fn::Sub": "arn:aws:s3:::pollybatch-${AWS::AccountId}-${AWS::Region}/*"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "PollyDocumentProcessorRepository": {
+            "Type": "AWS::ECR::Repository",
+            "DeletionPolicy": "Retain",
+            "Properties": {
+                "RepositoryName": "polly_document_processor"
+            }
+        },
+        "CodeBuildServiceRole": {
+            "Type": "AWS::IAM::Role",
+            "Properties": {
+                "AssumeRolePolicyDocument": {
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {
+                                "Service": "codebuild.amazonaws.com"
+                            },
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                },
+                "Path": "/",
+                "Policies": [
+                    {
+                        "PolicyName": "CodeBuildServicePolicy",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "logs:CreateLogGroup",
+                                        "logs:CreateLogStream",
+                                        "logs:PutLogEvents",
+                                        "logs:DescribeLogStreams"
+                                    ],
+                                    "Resource": "arn:aws:logs:*:*:*"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "ecr:BatchCheckLayerAvailability",
+                                        "ecr:CompleteLayerUpload",
+                                        "ecr:GetAuthorizationToken",
+                                        "ecr:InitiateLayerUpload",
+                                        "ecr:PutImage",
+                                        "ecr:UploadLayerPart"
+                                    ],
+                                    "Resource": "*"
+                                },
+                                {
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "s3:GetObject",
+                                        "s3:GetObjectVersion"
+                                    ],
+                                    "Resource": {
+                                        "Fn::Sub": "arn:aws:s3:::*"
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            }
+        },
+        "PollyBatchDocumentProcessorBuild": {
+            "Type": "AWS::CodeBuild::Project",
+            "Properties": {
+                "Name": "PollyBatchDocumentProcessorBuild",
+                "Description": "Builds the Polly Batch Document Processor Docker image used by the AWS Batch service",
+                "ServiceRole": {
+                    "Fn::GetAtt": [
+                        "CodeBuildServiceRole",
+                        "Arn"
+                    ]
+                },
+                "Artifacts": {
+                    "Type": "no_artifacts"
+                },
+                "Source": {
+                    "Type": "S3",
+                    "Location": {
+                        "Fn::Sub": "${CodeBucket}/PollyDocumentProcessor.zip"
+                    }
+                },
+                "Environment": {
+                    "ComputeType": "BUILD_GENERAL1_SMALL",
+                    "Type": "LINUX_CONTAINER",
+                    "Image": "aws/codebuild/docker:1.12.1",
+                    "EnvironmentVariables": [
+                        {
+                            "Name": "AWS_DEFAULT_REGION",
+                            "Value": {
+                                "Ref": "AWS::Region"
+                            }
+                        },
+                        {
+                            "Name": "AWS_ACCOUNT_ID",
+                            "Value": {
+                                "Ref": "AWS::AccountId"
+                            }
+                        },
+                        {
+                            "Name": "IMAGE_REPO_NAME",
+                            "Value": "polly_document_processor"
+                        },
+                        {
+                            "Name": "IMAGE_TAG",
+                            "Value": "latest"
+                        }
+                    ]
+                }
+            }
+        },
+        "CodeBuildTrigger": {
+            "Type": "Custom::CodeBuildTrigger",
+            "DependsOn": [
+                "PollyBatchDocumentProcessorBuild",
+                "PollyDocumentProcessorRepository",
+                "S3Bucket"
+            ],
+            "Properties": {
+                "ServiceToken": {
+                    "Fn::GetAtt": [
+                        "CodeBuildTriggerFunction",
+                        "Arn"
+                    ]
+                },
+                "ProjectName": {
+                    "Ref": "PollyBatchDocumentProcessorBuild"
+                },
+                "Bucket": {
+                    "Fn::Sub": "pollybatch-${AWS::AccountId}-${AWS::Region}"
+                },
+                "Key": "docker/src/PollyDocumentProcessor.zip",
+                "SrcUrl": {
+                    "Fn::Sub": "https://s3.amazonaws.com/${CodeBucket}/PollyDocumentProcessor.zip"
+                }
+            }
+        },
+        "BatchComputeEnv": {
+            "Type": "AWS::Batch::ComputeEnvironment",
+            "Properties": {
+                "Type": "MANAGED",
+                "ServiceRole": {
+                    "Fn::GetAtt": [
+                        "AWSBatchServiceRole",
+                        "Arn"
+                    ]
+                },
+                "ComputeEnvironmentName": "PollyDocumentComputeEnvironment",
+                "ComputeResources": {
+                    "MinvCpus": 0,
+                    "MaxvCpus": 128,
+                    "DesiredvCpus": 16,
+                    "SecurityGroupIds": [
+                        {
+                            "Ref": "SecurityGroup"
+                        }
+                    ],
+                    "Type": "EC2",
+                    "Subnets": {
+                        "Ref": "PrivateSubnets"
+                    },
+                    "InstanceRole": {
+                        "Ref": "InstanceProfile"
+                    },
+                    "InstanceTypes": [
+                        "optimal"
+                    ]
+                },
+                "State": "ENABLED"
+            }
+        },
+        "BatchJobQueue": {
+            "Type": "AWS::Batch::JobQueue",
+            "Properties": {
+                "ComputeEnvironmentOrder": [
+                    {
+                        "Order": 1,
+                        "ComputeEnvironment": {
+                            "Ref": "BatchComputeEnv"
+                        }
+                    }
+                ],
+                "State": "ENABLED",
+                "Priority": 1,
+                "JobQueueName": "polly_document_queue"
+            }
+        },
+        "BatchJobDefinition": {
+            "Type": "AWS::Batch::JobDefinition",
+            "Properties": {
+                "Type": "container",
+                "JobDefinitionName": "polly_document_processor",
+                "ContainerProperties": {
+                    "MountPoints": [
+                        {
+                            "ReadOnly": false,
+                            "SourceVolume": "audiofiles",
+                            "ContainerPath": "/audio"
+                        }
+                    ],
+                    "Volumes": [
+                        {
+                            "Host": {
+                                "SourcePath": "/tmp/audiofiles"
+                            },
+                            "Name": "audiofiles"
+                        }
+                    ],
+                    "Command": [
+                        "-b",
+                        "Ref::bucket",
+                        "-k",
+                        "Ref::key",
+                        "-t",
+                        "Ref::topic",
+                        "-m",
+                        "Ref::maxchars"
+                    ],
+                    "Memory": 2048,
+                    "Privileged": false,
+                    "JobRoleArn": {
+                        "Fn::GetAtt": [
+                            "BatchJobRole",
+                            "Arn"
+                        ]
+                    },
+                    "ReadonlyRootFilesystem": false,
+                    "Vcpus": 16,
+                    "Image": {
+                        "Fn::Sub": "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/polly_document_processor"
+                    },
+                    "Environment": [
+                        {
+                            "Name": "AUDIOFILE_TMP_DIR",
+                            "Value": "/audio"
+                        }
+                    ]
+                },
+                "RetryStrategy": {
+                    "Attempts": 3
+                }
+            }
+        },
+        "SnsTopic": {
+            "Type": "AWS::SNS::Topic",
+            "Properties": {
+                "Subscription": [
+                    {
+                        "Endpoint": {
+                            "Ref": "EmailAddress"
+                        },
+                        "Protocol": "email"
+                    }
+                ],
+                "TopicName": "AudiobookTopic"
+            }
+        }
+    },
+    "Outputs": {
+        "S3Bucket": {
+            "Description": "The S3 bucket where the books should be uploaded to.",
+            "Value": {
+                "Ref": "S3Bucket"
+            }
+        }
+    }
+}
