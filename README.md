@@ -233,6 +233,8 @@ Now run the script file
 
 $ destroy_stack.sh
 
+you will be prompted to enter the bucket name, paste the bucket name and press enter
+
 Wait till you get the message "Stack Deleted" and all stacks used for the service provision would have been deleted. you can confirm by going to the CloudFormation page and you will see that the stacks are being deleted and also go to your S3 page and you will see that the bucket created by the Audiobook stack has also been deleted.
 
 You can run the whole process all over again if you need the services again. 
